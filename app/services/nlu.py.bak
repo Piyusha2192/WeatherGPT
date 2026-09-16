@@ -1,0 +1,144 @@
+"""
+Query understanding engine.
+
+Design: try the LLM provider first (via a tool-call / structured-output
+prompt) if one is configured; otherwise fall back to lightweight rule-based
+parsing. This means the API is fully runnable and demoable with zero LLM
+keys, and gets smarter the moment a key is added — same interface either way.
+"""
+import re
+import json
+from datetime import date, timedelta
+
+from app.models.schemas import Intent, ParsedQuery
+from app.core.config import settings
+from app.services import llm_client
+
+_FORECAST_WORDS = ("forecast", "tomorrow", "next", "week", "will it rain", "rain kal")
+_ALERT_WORDS = ("alert", "warning", "cyclone", "flood", "storm", "danger")
+_ADVISORY_WORDS = ("advisory", "crop", "sow", "irrigat", "harvest", "farmer")
+_HISTORICAL_WORDS = ("last year", "history", "historical", "trend", "average", "compare")
+
+# crude "in <location>" / "at <location>" extractor for the rule-based fallback.
+# Deliberately greedy up to punctuation/end-of-string — the greedy capture is
+# then trimmed of trailing non-location words (see _strip_trailing_stopwords),
+# so "in Pune tomorrow?" resolves to "Pune", not "Pune tomorrow".
+_LOCATION_PATTERN = re.compile(r"\b(?:in|at|for|near)\s+([A-Za-z][A-Za-z\s]{1,40})", re.IGNORECASE)
+
+# Words that can legitimately trail a location mention but aren't part of the
+# place name itself. Built from the intent keyword lists plus common time/
+# filler words seen in casual weather queries.
+_TRAILING_STOPWORDS = {
+    w.split()[0] for w in (*_FORECAST_WORDS, *_ALERT_WORDS, *_ADVISORY_WORDS, *_HISTORICAL_WORDS)
+} | {
+    "today", "tonight", "now", "please", "right", "this", "weekend",
+    "morning", "afternoon", "evening", "currently", "kal", "abhi",
+}
+
+
+def _strip_trailing_stopwords(location_text: str) -> str:
+    """Repeatedly drop trailing words that are time/intent keywords rather
+    than part of the place name, e.g. 'Pune tomorrow' -> 'Pune'."""
+    words = location_text.strip().strip("?.,!").split()
+    while words and words[-1].lower() in _TRAILING_STOPWORDS:
+        words.pop()
+    return " ".join(words)
+
+
+def _rule_based_parse(text: str, language: str) -> ParsedQuery:
+    lowered = text.lower()
+
+    if any(w in lowered for w in _ALERT_WORDS):
+        intent = Intent.ALERT_CHECK
+    elif any(w in lowered for w in _ADVISORY_WORDS):
+        intent = Intent.ADVISORY
+    elif any(w in lowered for w in _HISTORICAL_WORDS):
+        intent = Intent.HISTORICAL
+    elif any(w in lowered for w in _FORECAST_WORDS):
+        intent = Intent.FORECAST
+    else:
+        intent = Intent.CURRENT_WEATHER
+
+    location_match = _LOCATION_PATTERN.search(text)
+    location_text = None
+    if location_match:
+        stripped = _strip_trailing_stopwords(location_match.group(1))
+        location_text = stripped or None
+
+    date_from = date.today()
+    date_to = date_from + timedelta(days=3) if intent == Intent.FORECAST else date_from
+
+    return ParsedQuery(
+        intent=intent,
+        location_text=location_text,
+        date_from=date_from,
+        date_to=date_to,
+        language=language,
+        raw_text=text,
+    )
+
+
+async def _llm_parse(text: str, language: str) -> ParsedQuery | None:
+    """LLM-based query understanding via OpenAI JSON-mode structured output.
+
+    Falls back to the rule-based parser (by returning None) if no provider/
+    key is configured, or if the call fails for any reason — a flaky LLM
+    call should never take the whole app down.
+    """
+    if settings.llm_provider != "openai" or not settings.openai_api_key:
+        return None
+
+    try:
+        client = llm_client.get_openai_client()
+        system_prompt = (
+            "You extract structured info from a weather-related user query. "
+            "Respond with ONLY a JSON object, no other text, with exactly these keys:\n"
+            '- "intent": one of "current_weather", "forecast", "alert_check", '
+            '"advisory", "historical", "unknown"\n'
+            '- "location_text": the place name mentioned, as a string, with NO '
+            "time/date words in it (e.g. \"Pune\" not \"Pune tomorrow\"). "
+            "null if no place is mentioned.\n"
+            '- "days_ahead": integer 0-7, how many days forward the query refers '
+            'to (0 = now/today).'
+        )
+        resp = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0,
+            max_tokens=150,
+        )
+        raw = resp.choices[0].message.content or "{}"
+        parsed_json = json.loads(raw)
+
+        try:
+            intent = Intent(parsed_json.get("intent", "unknown"))
+        except ValueError:
+            intent = Intent.UNKNOWN
+
+        days_ahead = int(parsed_json.get("days_ahead") or 0)
+        date_from = date.today()
+        span = max(days_ahead, 3) if intent == Intent.FORECAST else days_ahead
+        date_to = date_from + timedelta(days=span)
+
+        return ParsedQuery(
+            intent=intent,
+            location_text=parsed_json.get("location_text") or None,
+            date_from=date_from,
+            date_to=date_to,
+            language=language,
+            raw_text=text,
+        )
+    except Exception:
+        # Network error, rate limit, malformed JSON, etc. — degrade gracefully.
+        return None
+
+
+async def parse_query(text: str, language: str = "en") -> ParsedQuery:
+    parsed = await _llm_parse(text, language)
+    if parsed is not None:
+        return parsed
+    return _rule_based_parse(text, language)
